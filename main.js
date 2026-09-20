@@ -63,7 +63,7 @@ const CONFIG = {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     },
-    timeout: 30000
+    timeoutSeconds: 30
   },
 
   sheetName: "MAIN",
@@ -95,7 +95,7 @@ const CONFIG = {
 
   afterRowDelayMs: 500,
 
-  maxRetries: 5,
+  maxRetries: 3,
   maxRuntimeMs: 5 * 60 * 1000,
   runtimeSafetyMs: 5000,
 
@@ -109,8 +109,17 @@ const CONFIG = {
     jitterMs: 400
   },
 
+  rowStatus: {
+    updatingSkipMs: 30 * 1000,
+    doneSkipMs: 10 * 1000,
+    skipSkipMs: 10 * 1000
+  },
+
   locks: {
-    waitMs: 1000
+    waitMs: 1000,
+    maxConcurrentRuns: 3,
+    leaseMs: 6 * 60 * 1000,
+    activeRunsKey: "STOCK_ACTIVE_RUNS"
   }
 };
 
@@ -126,7 +135,7 @@ const THROTTLE_STATE = {
  * SINGLE ENTRY POINT
  ********************/
 function updateStockPricesSequentially() {
-  withScriptLock_("STOCK UPDATE", function () {
+  withConcurrencyLimit_("STOCK UPDATE", function () {
     const ctx = createRunContext_();
 
     logRunStart_(ctx, "STOCK UPDATE");
@@ -179,13 +188,17 @@ function isRuntimeNearlyExceeded_(ctx) {
 }
 
 /********************
- * LOCKING
+ * LOCKING / CONCURRENCY
  ********************/
-function withScriptLock_(label, fn) {
-  const lock = LockService.getScriptLock();
+function withConcurrencyLimit_(label, fn) {
+  const slotId = acquireRunSlot_(label);
 
-  if (!lock.tryLock(CONFIG.locks.waitMs)) {
-    Logger.log("⛔ %s skipped: another execution is already running.", label);
+  if (!slotId) {
+    Logger.log(
+      "⛔ %s skipped: maximum %s executions already running.",
+      label,
+      CONFIG.locks.maxConcurrentRuns
+    );
     return;
   }
 
@@ -194,6 +207,116 @@ function withScriptLock_(label, fn) {
   } catch (e) {
     Logger.log("❌ %s failed: %s", label, e.message || e);
     throw e;
+  } finally {
+    releaseRunSlot_(slotId);
+  }
+}
+
+function acquireRunSlot_(label) {
+  const lock = LockService.getScriptLock();
+
+  if (!lock.tryLock(CONFIG.locks.waitMs)) {
+    Logger.log("⛔ %s skipped: unable to acquire concurrency-state lock.", label);
+    return null;
+  }
+
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const now = Date.now();
+    let slots = readActiveRunSlots_(props);
+
+    // Clean up stale slots left behind by killed/timed-out executions.
+    slots = slots.filter(function (slot) {
+      return slot && Number(slot.expiresAt) > now;
+    });
+
+    if (slots.length >= CONFIG.locks.maxConcurrentRuns) {
+      props.setProperty(CONFIG.locks.activeRunsKey, JSON.stringify(slots));
+      return null;
+    }
+
+    const slotId = Utilities.getUuid();
+
+    slots.push({
+      id: slotId,
+      startedAt: now,
+      expiresAt: now + CONFIG.locks.leaseMs
+    });
+
+    props.setProperty(CONFIG.locks.activeRunsKey, JSON.stringify(slots));
+
+    Logger.log(
+      "🔓 %s acquired concurrency slot | active=%s/%s | slot=%s",
+      label,
+      slots.length,
+      CONFIG.locks.maxConcurrentRuns,
+      slotId
+    );
+
+    return slotId;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function releaseRunSlot_(slotId) {
+  const lock = LockService.getScriptLock();
+
+  try {
+    lock.waitLock(5000);
+
+    const props = PropertiesService.getScriptProperties();
+    let slots = readActiveRunSlots_(props);
+
+    slots = slots.filter(function (slot) {
+      return slot && slot.id !== slotId;
+    });
+
+    props.setProperty(CONFIG.locks.activeRunsKey, JSON.stringify(slots));
+
+    Logger.log(
+      "🔒 concurrency slot released | active=%s/%s | slot=%s",
+      slots.length,
+      CONFIG.locks.maxConcurrentRuns,
+      slotId
+    );
+  } catch (e) {
+    Logger.log(
+      "⚠️ failed to release concurrency slot=%s | %s",
+      slotId,
+      e.message || e
+    );
+  } finally {
+    if (lock.hasLock()) {
+      lock.releaseLock();
+    }
+  }
+}
+
+function readActiveRunSlots_(props) {
+  try {
+    const raw = props.getProperty(CONFIG.locks.activeRunsKey);
+    const parsed = raw ? JSON.parse(raw) : [];
+
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    Logger.log("⚠️ invalid concurrency state; resetting active slots");
+    return [];
+  }
+}
+
+function withAfterCloseStateLock_(fn) {
+  const lock = LockService.getScriptLock();
+
+  if (!lock.tryLock(CONFIG.locks.waitMs)) {
+    return {
+      isAllowed: false,
+      reason: "After-close state lock busy"
+    };
+  }
+
+  try {
+    return fn();
   } finally {
     lock.releaseLock();
   }
@@ -334,29 +457,60 @@ function shouldSkipRowByStatus_(statusText, now) {
 
   if (/^Updating\b/i.test(prevText)) {
     const prevDt = parseStatusCellTime_(prevText, now);
+    const ageMs = prevDt ? now.getTime() - prevDt.getTime() : null;
 
-    if (prevDt && now.getTime() - prevDt.getTime() >= 0 && now.getTime() - prevDt.getTime() < 10 * 1000) {
-      return { skip: true, writeSkip: false, reason: "Updating < 10s" };
+    if (
+      prevDt &&
+      ageMs >= 0 &&
+      ageMs < CONFIG.rowStatus.updatingSkipMs
+    ) {
+      return {
+        skip: true,
+        writeSkip: false,
+        reason: "Updating recently"
+      };
     }
   }
 
   if (/^Skip\s*@/i.test(prevText)) {
     const prevDt = parseStatusCellTime_(prevText, now);
+    const ageMs = prevDt ? now.getTime() - prevDt.getTime() : null;
 
-    if (prevDt && now.getTime() - prevDt.getTime() >= 0 && now.getTime() - prevDt.getTime() < 10 * 1000) {
-      return { skip: true, writeSkip: false, reason: "Skip < 10s" };
+    if (
+      prevDt &&
+      ageMs >= 0 &&
+      ageMs < CONFIG.rowStatus.skipSkipMs
+    ) {
+      return {
+        skip: true,
+        writeSkip: false,
+        reason: "Skip recently"
+      };
     }
   }
 
   if (/^Done\s*@/i.test(prevText)) {
     const prevDt = parseStatusCellTime_(prevText, now);
+    const ageMs = prevDt ? now.getTime() - prevDt.getTime() : null;
 
-    if (prevDt && now.getTime() - prevDt.getTime() >= 0 && now.getTime() - prevDt.getTime() < 10 * 1000) {
-      return { skip: true, writeSkip: true, reason: "Done < 10s" };
+    if (
+      prevDt &&
+      ageMs >= 0 &&
+      ageMs < CONFIG.rowStatus.doneSkipMs
+    ) {
+      return {
+        skip: true,
+        writeSkip: true,
+        reason: "Done recently"
+      };
     }
   }
 
-  return { skip: false, writeSkip: false, reason: "" };
+  return {
+    skip: false,
+    writeSkip: false,
+    reason: ""
+  };
 }
 
 /********************
@@ -364,6 +518,8 @@ function shouldSkipRowByStatus_(statusText, now) {
  ********************/
 function fetchSCSTradeSnapshotWithRetry_(symbol, maxRetries) {
   let last = "Error";
+  let bestPartial = null;
+  let bestPartialScore = 0;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     Logger.log("      ↻ snapshot retry | symbol=%s | attempt=%s/%s", symbol, attempt, maxRetries);
@@ -371,7 +527,10 @@ function fetchSCSTradeSnapshotWithRetry_(symbol, maxRetries) {
     try {
       const snapshot = getSCSTradeSnapshot_(symbol);
 
-      if (snapshot && (isFiniteNumber_(snapshot.price) || isFiniteNumber_(snapshot.changePct))) {
+      const priceOk = snapshot && isFiniteNumber_(snapshot.price);
+      const changeOk = snapshot && isFiniteNumber_(snapshot.changePct);
+
+      if (priceOk && changeOk) {
         Logger.log(
           "      ✅ snapshot success | symbol=%s | price=%s | change=%s | changePct=%s",
           symbol,
@@ -383,10 +542,19 @@ function fetchSCSTradeSnapshotWithRetry_(symbol, maxRetries) {
         return snapshot;
       }
 
-      last = "Invalid snapshot";
+      const partialScore = (priceOk ? 1 : 0) + (changeOk ? 1 : 0);
+
+      if (partialScore > 0 && partialScore >= bestPartialScore) {
+        bestPartial = snapshot;
+        bestPartialScore = partialScore;
+      }
+
+      last = partialScore > 0 ? "Partial snapshot" : "Invalid snapshot";
 
       Logger.log(
-        "      ⚠️ invalid snapshot | symbol=%s | price=%s | change=%s | changePct=%s",
+        partialScore > 0
+          ? "      ⚠️ partial snapshot; retrying | symbol=%s | price=%s | change=%s | changePct=%s"
+          : "      ⚠️ invalid snapshot | symbol=%s | price=%s | change=%s | changePct=%s",
         symbol,
         snapshot ? snapshot.price : "N/A",
         snapshot ? snapshot.change : "N/A",
@@ -405,6 +573,18 @@ function fetchSCSTradeSnapshotWithRetry_(symbol, maxRetries) {
         Utilities.sleep(waitMs);
       }
     }
+  }
+
+  if (bestPartial) {
+    Logger.log(
+      "      ⚠️ snapshot retries exhausted; using best partial | symbol=%s | price=%s | change=%s | changePct=%s",
+      symbol,
+      bestPartial.price,
+      bestPartial.change,
+      bestPartial.changePct
+    );
+
+    return bestPartial;
   }
 
   Logger.log("      ⛔ snapshot retries exhausted | symbol=%s | last=%s", symbol, last);
@@ -835,54 +1015,56 @@ function isRunAllowedNow_Stateful_(sheet, now) {
     return { isAllowed: false, reason: "Outside after-close window" };
   }
 
-  const st = readAfterCloseState_(sheet, stateCell);
+  return withAfterCloseStateLock_(function () {
+    const st = readAfterCloseState_(sheet, stateCell);
 
-  if (!st.closeKey || st.closeKey !== closeKey) {
-    st.closeKey = closeKey;
-    st.step = 0;
-    st.lastRun = "";
-    writeAfterCloseState_(sheet, stateCell, st);
-  }
-
-  const caught = catchUpAfterCloseStep_(closeDt, nextOpenDt, now, st);
-
-  if (caught.step !== st.step) {
-    st.step = caught.step;
-    writeAfterCloseState_(sheet, stateCell, st);
-  }
-
-  const nextRunDt = caught.nextRunDt;
-
-  if (nextRunDt >= nextOpenDt) {
-    return { isAllowed: false, reason: "After-close schedule finished" };
-  }
-
-  const tol = getToleranceMins_();
-  const diffMins = Math.abs(now.getTime() - nextRunDt.getTime()) / 60000;
-
-  if (diffMins > tol) {
-    return {
-      isAllowed: false,
-      reason: "Not scheduled yet (next=" + fmt_(nextRunDt, "yyyy-MM-dd HH:mm:ss") + ")"
-    };
-  }
-
-  if (st.lastRun) {
-    const lastRunDt = parseLocalTs_(st.lastRun);
-
-    if (lastRunDt && Math.abs(now.getTime() - lastRunDt.getTime()) / 60000 <= tol) {
-      return { isAllowed: false, reason: "Already ran in this schedule window" };
+    if (!st.closeKey || st.closeKey !== closeKey) {
+      st.closeKey = closeKey;
+      st.step = 0;
+      st.lastRun = "";
+      writeAfterCloseState_(sheet, stateCell, st);
     }
-  }
 
-  st.lastRun = tsNow;
-  st.step = Math.max(0, Number(st.step || 0)) + 1;
-  writeAfterCloseState_(sheet, stateCell, st);
+    const caught = catchUpAfterCloseStep_(closeDt, nextOpenDt, now, st);
 
-  return {
-    isAllowed: true,
-    reason: "After-close run (scheduled=" + fmt_(nextRunDt, "yyyy-MM-dd HH:mm:ss") + ", stepUsed=" + caught.step + ")"
-  };
+    if (caught.step !== st.step) {
+      st.step = caught.step;
+      writeAfterCloseState_(sheet, stateCell, st);
+    }
+
+    const nextRunDt = caught.nextRunDt;
+
+    if (nextRunDt >= nextOpenDt) {
+      return { isAllowed: false, reason: "After-close schedule finished" };
+    }
+
+    const tol = getToleranceMins_();
+    const diffMins = Math.abs(now.getTime() - nextRunDt.getTime()) / 60000;
+
+    if (diffMins > tol) {
+      return {
+        isAllowed: false,
+        reason: "Not scheduled yet (next=" + fmt_(nextRunDt, "yyyy-MM-dd HH:mm:ss") + ")"
+      };
+    }
+
+    if (st.lastRun) {
+      const lastRunDt = parseLocalTs_(st.lastRun);
+
+      if (lastRunDt && Math.abs(now.getTime() - lastRunDt.getTime()) / 60000 <= tol) {
+        return { isAllowed: false, reason: "Already ran in this schedule window" };
+      }
+    }
+
+    st.lastRun = tsNow;
+    st.step = Math.max(0, Number(st.step || 0)) + 1;
+    writeAfterCloseState_(sheet, stateCell, st);
+
+    return {
+      isAllowed: true,
+      reason: "After-close run (scheduled=" + fmt_(nextRunDt, "yyyy-MM-dd HH:mm:ss") + ", stepUsed=" + caught.step + ")"
+    };
+  });
 }
 
 function getToleranceMins_() {
